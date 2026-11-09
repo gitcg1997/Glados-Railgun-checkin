@@ -1,5 +1,7 @@
+import hashlib
 import os
 import sys
+import time
 from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
@@ -32,6 +34,7 @@ class APIEndpoint(Enum):
     """API端点"""
 
     CHECKIN = "/api/user/checkin"
+    CHECKIN_CHALLENGE = "/api/user/checkin/challenge"
     STATUS = "/api/user/status"
     POINTS = "/api/user/points"
     EXCHANGE = "/api/user/exchange"
@@ -191,6 +194,10 @@ PLATFORM_UA = {
     "Android": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
 }
 
+# 签到 Bot Challenge：与网页端当前实现一致。缺少 challenge 时服务端判定为自动签到，只给 1 积分。
+CHALLENGE_SUFFIX = "glados-observe-v1"
+CHALLENGE_DELAY_SECONDS = 2.5
+
 
 class API:
     """API 调用"""
@@ -205,6 +212,10 @@ class API:
         self.cookie_index: int = cookie_index
         self.verbose: bool = verbose
         self.headers: Dict[str, str] = self._get_headers()
+        # 可选：用提取 Cookie 时浏览器的真实 UA，规避 code 4 / device-mismatch
+        custom_ua = os.environ.get("GLADOS_USER_AGENT", "").strip()
+        if custom_ua:
+            self.headers["user-agent"] = custom_ua
         self._device_ua_cache: Dict[str, str] = {}
         self.session = requests.Session()
         self.session.headers.update(self.headers)
@@ -242,10 +253,16 @@ class API:
         return False
 
     def _get_headers(self) -> Dict[str, str]:
-        """获取请求头"""
+        """获取请求头（补齐浏览器常规头，减少非浏览器特征）"""
         return {
             "origin": f"https://{self.domain}",
+            "referer": f"https://{self.domain}/console/checkin",
             "user-agent": PLATFORM_UA["Windows"],
+            "accept": "application/json, text/plain, */*",
+            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty",
         }
 
     def _log(self, level: str, emoji: str, message: str, force: bool = False) -> None:
@@ -266,7 +283,7 @@ class API:
         """获取完整 URL"""
         return f"https://{self.domain}{path}"
 
-    def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "", user_agent: Optional[str] = None) -> Optional[requests.Response]:
+    def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "", user_agent: Optional[str] = None, json_body: bool = False) -> Optional[requests.Response]:
         """发送 HTTP 请求"""
         session_headers = self.headers.copy()
         if user_agent:
@@ -275,7 +292,12 @@ class API:
 
         try:
             if method.upper() == "POST":
-                response = self.session.post(url, headers=session_headers, data=data, timeout=(60, 120))
+                if json_body:
+                    session_headers["content-type"] = "application/json;charset=UTF-8"
+                    response = self.session.post(url, headers=session_headers, json=data, timeout=(60, 120))
+                else:
+                    session_headers["content-type"] = "application/x-www-form-urlencoded"
+                    response = self.session.post(url, headers=session_headers, data=data, timeout=(60, 120))
             elif method.upper() == "GET":
                 response = self.session.get(url, headers=session_headers, timeout=(60, 120))
             else:
@@ -290,20 +312,47 @@ class API:
             self._log("error", LogEmoji.ERROR, f"向 {url} 发起请求时发生网络错误: {e}", force=True)
             return None
 
-    def _get_checkin_data(self) -> Dict[str, str]:
-        """获取签到数据"""
-        return {"token": self.domain}
+    def _get_checkin_challenge(self, cookies: str, user_agent: str) -> Optional[Tuple[str, str]]:
+        """获取签到 challenge 并计算 proof；失败返回 None，由调用方回退旧协议。"""
+        url = self._get_full_url(APIEndpoint.CHECKIN_CHALLENGE.value)
+        response = self._make_request(url, "GET", cookies=cookies, user_agent=user_agent)
+        if not response:
+            self._log("warning", LogEmoji.WARNING, "签到 challenge 请求失败，按旧协议提交", force=True)
+            return None
+        try:
+            data = response.json()
+        except ValueError:
+            self._log("warning", LogEmoji.WARNING,
+                      f"签到 challenge 响应不是 JSON（{response.text[:120]}），按旧协议提交", force=True)
+            return None
+        if not isinstance(data, dict):
+            self._log("warning", LogEmoji.WARNING, "签到 challenge 响应格式异常，按旧协议提交", force=True)
+            return None
+        if data.get("code") == -2:
+            self._log("error", LogEmoji.ERROR,
+                      "签到 challenge 返回没有权限(code=-2)：Cookie 可能已失效，请更新 GLADOS_COOKIES", force=True)
+            return None
+        nonce = data.get("nonce")
+        if not nonce:
+            self._log("warning", LogEmoji.WARNING,
+                      f"签到 challenge 缺少 nonce（响应 {data}），按旧协议提交", force=True)
+            return None
+
+        # 网页端在 challenge 与提交之间有约 2.5 秒停留
+        time.sleep(CHALLENGE_DELAY_SECONDS)
+        proof = hashlib.sha256(f"{nonce}.{CHALLENGE_SUFFIX}".encode()).hexdigest()
+        self._log("info", LogEmoji.INFO, "已获取签到 challenge，按新协议提交", force=True)
+        return str(nonce), proof
 
     @log_method
     def checkin(self, cookies: str) -> Dict[str, Union[str, CheckinStatus]]:
-        """执行签到，含设备平台自适应重试"""
+        """执行签到，含 challenge 校验与设备平台自适应重试"""
         url = self._get_full_url(self.CHECKIN_URL)
-        checkin_data = self._get_checkin_data()
 
         # 起始 UA 优先复用已学得的设备 UA，否则用会话默认 UA
         start_ua = self._device_ua_cache.get("_last") or self.headers.get("user-agent")
 
-        raw = self._checkin_attempt(url, checkin_data, cookies, start_ua)
+        raw = self._checkin_attempt(url, cookies, start_ua)
 
         # 设备不匹配(code 4)时按服务端 loginDevice 切换 UA 重试一次
         if raw is not None and raw.get("code") == 4 and raw.get("reason") == "device-mismatch":
@@ -311,13 +360,25 @@ class API:
             recover_ua = self._device_ua_cache.get(login_device) or PLATFORM_UA.get(login_device)
             if recover_ua and recover_ua != start_ua:
                 self._log("warning", LogEmoji.WARNING, f"设备平台不匹配 (loginDevice={login_device})，切换 UA 重试", force=True)
-                raw = self._checkin_attempt(url, checkin_data, cookies, recover_ua)
+                raw = self._checkin_attempt(url, cookies, recover_ua)
 
         return self._parse_checkin(raw)
 
-    def _checkin_attempt(self, url: str, data: Dict, cookies: str, user_agent: str) -> Optional[Dict]:
+    def _checkin_attempt(self, url: str, cookies: str, user_agent: str) -> Optional[Dict]:
         """发起一次签到请求并返回解析后的响应体（失败返回 None）"""
-        response = self._make_request(url, "POST", data, cookies, user_agent=user_agent)
+        challenge = self._get_checkin_challenge(cookies, user_agent)
+        payload: Dict[str, str] = {"token": self.domain}
+        if challenge:
+            nonce, proof = challenge
+            payload.update({"nonce": nonce, "proof": proof})
+            json_body = True
+        else:
+            self._log("warning", LogEmoji.WARNING,
+                      "未取得签到 challenge，按旧协议提交（可能只获得 1 积分）", force=True)
+            json_body = False
+
+        response = self._make_request(url, "POST", payload, cookies,
+                                      user_agent=user_agent, json_body=json_body)
         if not response:
             return None
         try:
@@ -351,7 +412,16 @@ class API:
 
         code = raw.get("code", -2)
         message = raw.get("message", "无消息字段")
+        # 本次所得积分以签到记录 list[0].change 为准，顶层 points 未必是本次所得
         points = str(raw.get("points", 0))
+        records = raw.get("list")
+        if isinstance(records, list) and records and isinstance(records[0], dict):
+            change = records[0].get("change")
+            if change is not None:
+                points = str(change)
+        if "automated check-in detected" in str(message).lower():
+            self._log("error", LogEmoji.ERROR,
+                      "服务端判定为自动签到（机房 IP / TLS 指纹），本次可能只获得 1 积分", force=True)
 
         if code == CheckinStatus.SUCCESS.value:
             self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {points}, message : {message} }}")
