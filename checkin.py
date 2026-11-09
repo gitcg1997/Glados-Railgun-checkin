@@ -329,8 +329,8 @@ class API:
             self._log("warning", LogEmoji.WARNING, "签到 challenge 响应格式异常，按旧协议提交", force=True)
             return None
         if data.get("code") == -2:
-            self._log("error", LogEmoji.ERROR,
-                      "签到 challenge 返回没有权限(code=-2)：Cookie 可能已失效，请更新 GLADOS_COOKIES", force=True)
+            self._log("warning", LogEmoji.WARNING,
+                      "该域名无登录态(code=-2，如未开通过该站账号)，跳过 challenge", force=True)
             return None
         nonce = data.get("nonce")
         if not nonce:
@@ -374,7 +374,7 @@ class API:
             json_body = True
         else:
             self._log("warning", LogEmoji.WARNING,
-                      "未取得签到 challenge，按旧协议提交（可能只获得 1 积分）", force=True)
+                      "未取得签到 challenge，按旧协议提交（该域名可能无登录态；主域名出现此提示则可能只获得 1 积分）", force=True)
             json_body = False
 
         response = self._make_request(url, "POST", payload, cookies,
